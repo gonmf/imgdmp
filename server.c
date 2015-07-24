@@ -19,7 +19,7 @@
 
 typedef struct __file_info_ {
 	unsigned int id;
-	ssize_t len;
+	unsigned int len;
 	void * data;
 } file_info;
 
@@ -37,7 +37,7 @@ static void init_id(){
 		last_id = 1;
 }
 
-static int new_id(){
+static unsigned int new_id(){
 	last_id++;
 	if(last_id < 1)
 		last_id = 1;
@@ -81,10 +81,10 @@ static void save_file(file_info * fi){
 			printf(" Avg.Size: %u bytes\n", avg_bytes);
 }
 
-static const file_info * find_file(int id, int l, int r){
+static const file_info * find_file(unsigned int id, unsigned int l, unsigned int r){
 	if(r <= l)
 		return NULL;
-	int m = (l + r) / 2;
+	unsigned int m = (l + r) / 2;
 	if(ring[m].id == id)
 		return &ring[m];
 	if(ring[m].id < id)
@@ -92,7 +92,7 @@ static const file_info * find_file(int id, int l, int r){
 	return find_file(id, l, m);
 }
 
-static const file_info * get_file(int id){
+static const file_info * get_file(unsigned int id){
 	if(ring_files == 0)
 		return NULL;
 	if(ring_files < MAX_FILES)
@@ -105,8 +105,8 @@ static const file_info * get_file(int id){
 	return NULL;
 }
 
-static ssize_t copy_while_alphanumeric(char * src, char * dst, ssize_t dst_siz){
-	ssize_t ret = 0;
+static unsigned int copy_while_alphanumeric(char * src, char * dst, unsigned int dst_siz){
+	unsigned int ret = 0;
 	while(ret < dst_siz - 1 && src[ret] != 0){
 		if((src[ret] >= '0' && src[ret] <= '9') || (src[ret] >= 'a' && src[ret] <= 'z') || (src[ret] >= 'A' && src[ret] <= 'Z') || src[ret] == '/'){
 			dst[ret] = src[ret];
@@ -118,8 +118,8 @@ static ssize_t copy_while_alphanumeric(char * src, char * dst, ssize_t dst_siz){
 	return ret;
 }
 
-static ssize_t copy_while_numeric(char * src, char * dst, ssize_t dst_siz){
-	ssize_t ret = 0;
+static unsigned int copy_while_numeric(char * src, char * dst, unsigned int dst_siz){
+	unsigned int ret = 0;
 	while(ret < dst_siz - 1 && src[ret] != 0){
 		if(src[ret] >= '0' && src[ret] <= '9'){
 			dst[ret] = src[ret];
@@ -131,7 +131,7 @@ static ssize_t copy_while_numeric(char * src, char * dst, ssize_t dst_siz){
 	return ret;
 }
 
-static void parse(char * buffer, int * request_method, char * request_uri, ssize_t uri_sz){
+static void parse(char * buffer, int * request_method, char * request_uri, unsigned int uri_sz){
 	if(buffer[0] == 'G' && buffer[1] == 'E' && buffer[2] == 'T' && buffer[3] == ' '){
 		*request_method = GET;
 		buffer += 4;
@@ -149,17 +149,20 @@ static void parse(char * buffer, int * request_method, char * request_uri, ssize
 static file_info * load_file(const char * filename){
 	char buffer[8 * 1024];
 	FILE * f = fopen(filename, "r");
-	ssize_t r = fread(buffer, 1, 8 * 1024, f);
+	unsigned int size = 0;
+	unsigned int r;
+	while((r = fread(buffer, 1, 8 * 1024 - size, f)) > 0)
+		size += r;
 	fclose(f);
 	file_info * ret = (file_info *)malloc(sizeof(file_info));
 	ret->id = 0;
-	ret->len = r;
+	ret->len = size;
 	ret->data = malloc(ret->len);
 	memcpy(ret->data, buffer, ret->len);
 	return ret;
 }
 
-static void full_write(int socket, char * buffer, ssize_t size){
+static void full_write(int socket, char * buffer, unsigned int size){
 	int w;
 	while((w = write(socket, buffer, size)) > 0){
 		buffer += w;
@@ -176,7 +179,7 @@ static void return_msg(int code, char * text, const char * msg, int socket){
 
 static void return_file(int code, char * text, const file_info * fi, int socket){
 	char buffer[1024];
-	snprintf(buffer, 1024, "HTTP/1.0 %d %s\nContent-Length: %lu\nServer: myn3\r\n\r\n", code, text, fi->len);
+	snprintf(buffer, 1024, "HTTP/1.0 %d %s\nContent-Length: %u\nServer: myn3\r\n\r\n", code, text, fi->len);
 	full_write(socket, buffer, strlen(buffer));
 	full_write(socket, fi->data, fi->len);
 	printf("%d %s\n", code, text);
@@ -191,9 +194,9 @@ static void return_hyperlink_to_file(const file_info * fi, int socket){
 	printf("200 OK\n");
 }
 
-static char * find_mem(char * hay, ssize_t h_len, char * needle, ssize_t n_len){
-	ssize_t i = 0;
-	ssize_t hi = 0;
+static char * find_mem(char * hay, unsigned int h_len, char * needle, unsigned int n_len){
+	unsigned int i = 0;
+	unsigned int hi = 0;
 	while(h_len - hi >= n_len){
 		int found = 1;
 		for(i = 0; i < n_len; ++i)
@@ -208,7 +211,7 @@ static char * find_mem(char * hay, ssize_t h_len, char * needle, ssize_t n_len){
 	return NULL;
 }
 
-static file_info * parse_data(char * buffer, ssize_t len, int * not_an_image, int * too_large, int * format_error, int * out_of_memory, int * format_error_or_too_large){
+static file_info * parse_data(char * buffer, unsigned int len, char * not_an_image, char * too_large, char * format_error, char * out_of_memory, char * format_error_or_too_large){
 	*not_an_image = 0;
 
 	/* discover encform boundary */
@@ -266,7 +269,7 @@ static file_info * parse_data(char * buffer, ssize_t len, int * not_an_image, in
 	return ret;
 }
 
-static ssize_t parse_content_length(char * buffer, ssize_t rd){
+static ssize_t parse_content_length(char * buffer, unsigned int rd){
 	char * str = "Content-Length: ";
 	char * s = strstr(buffer, str);
 	if(s == NULL)
@@ -274,7 +277,9 @@ static ssize_t parse_content_length(char * buffer, ssize_t rd){
 	s += strlen(str);
 	char buf[15];
 	copy_while_numeric(s, buf, 15);
-	ssize_t content_length = atoi(buf);
+	int content_length = atoi(buf);
+	if(content_length < 1)
+		return 0;
 	s = strstr(s, "\r\n\r\n");
 	if(s == NULL)
 		return 0;
@@ -345,9 +350,9 @@ int main(int argc, char * argv[]){
 		++connection_nr;
 		printf("Connection #%u established\n", connection_nr);
 
-		size_t request_size = 0;
-		int r;
-		ssize_t total_size = 0;
+		unsigned int request_size = 0;
+		unsigned int r;
+		unsigned int total_size = 0;
 		while(request_size < 1024 && (r = read(client_fd, buffer + request_size, BIG_BUF_SIZ - request_size)) > 0){
 			request_size += r;
 			buffer[request_size] = 0;
@@ -400,11 +405,11 @@ int main(int argc, char * argv[]){
 				break;
 			case POST:
 				if(strcmp(request_uri, "/") == 0){
-					int not_an_image = 0;
-					int too_large = 0;
-					int format_error = 0;
-					int out_of_memory = 0;
-					int format_error_or_too_large = 0;
+					char not_an_image = 0;
+					char too_large = 0;
+					char format_error = 0;
+					char out_of_memory = 0;
+					char format_error_or_too_large = 0;
 					file_info * data = parse_data(buffer, request_size, &not_an_image, &too_large, &format_error, &out_of_memory, &format_error_or_too_large);
 					if(not_an_image)
 						return_msg(400, "Bad Request", "File is not an image.", client_fd);
