@@ -13,8 +13,13 @@
 #define MAX_FILES 1000
 #define PORT 81
 
+#define DEBUG 1
+
 #define GET 1
 #define POST 2
+#define HEAD 3
+#define PUT 4
+#define DELETE 5
 #define BIG_BUF_SIZ (1024 + MAX_FILE_SIZ * 1024)
 
 typedef struct __file_info_ {
@@ -44,7 +49,7 @@ static unsigned int new_id(){
 	return last_id;
 }
 
-static void save_file(file_info * fi){
+static void save_file(const file_info * fi){
 	if(ring_files < MAX_FILES){
 		ring[ring_pos].id = fi->id;
 		ring[ring_pos].len = fi->len;
@@ -131,18 +136,32 @@ static unsigned int copy_while_numeric(char * src, char * dst, unsigned int dst_
 	return ret;
 }
 
-static void parse(char * buffer, int * request_method, char * request_uri, unsigned int uri_sz){
-	if(buffer[0] == 'G' && buffer[1] == 'E' && buffer[2] == 'T' && buffer[3] == ' '){
+static void parse(char * buffer, char * request_method, char * request_method_str, char * request_uri, unsigned int uri_sz){
+	unsigned int i = 0;
+	while(i < 9 && buffer[i] != ' '){
+		request_method_str[i] = buffer[i];
+		++i;
+	}
+	request_method_str[i] = 0;
+	
+	if(strcmp(request_method_str, "GET") == 0)
 		*request_method = GET;
-		buffer += 4;
-	}else
-		if(buffer[0] == 'P' && buffer[1] == 'O' && buffer[2] == 'S' && buffer[3] == 'T' && buffer[4] == ' '){
-			*request_method = POST;
-			buffer += 5;
-		}else{
-			*request_method = -1;
-			return;
-		}
+	else
+		if(strcmp(request_method_str, "HEAD") == 0)
+			*request_method = HEAD;
+		else
+			if(strcmp(request_method_str, "POST") == 0)
+				*request_method = POST;
+			else	
+				if(strcmp(request_method_str, "PUT") == 0)
+					*request_method = PUT;
+				else	
+					if(strcmp(request_method_str, "DELETE") == 0)
+						*request_method = DELETE;
+					else
+						*request_method = 0;	
+
+	buffer += i + 1;
 	copy_while_alphanumeric(buffer, request_uri, uri_sz);
 }
 
@@ -150,7 +169,7 @@ static file_info * load_file(const char * filename){
 	char buffer[8 * 1024];
 	FILE * f = fopen(filename, "r");
 	unsigned int size = 0;
-	unsigned int r;
+	int r;
 	while((r = fread(buffer, 1, 8 * 1024 - size, f)) > 0)
 		size += r;
 	fclose(f);
@@ -174,7 +193,7 @@ static void return_msg(int code, char * text, const char * msg, int socket){
 	char buffer[2048];
 	snprintf(buffer, 2048, "HTTP/1.0 %d %s\nContent-Length: %lu\nServer: myn3\r\n\r\n%s", code, text, strlen(msg), msg);
 	full_write(socket, buffer, strlen(buffer));
-	printf("%d %s\n", code, text);
+	printf("%d %s %s\n", code, text, msg);
 }
 
 static void return_file(int code, char * text, const file_info * fi, int socket){
@@ -351,7 +370,7 @@ int main(int argc, char * argv[]){
 		printf("Connection #%u established\n", connection_nr);
 
 		unsigned int request_size = 0;
-		unsigned int r;
+		int r;
 		unsigned int total_size = 0;
 		while(request_size < 1024 && (r = read(client_fd, buffer + request_size, BIG_BUF_SIZ - request_size)) > 0){
 			request_size += r;
@@ -376,10 +395,11 @@ int main(int argc, char * argv[]){
 			}
 		}
 
-		int request_method;
+		char request_method;
+		char request_method_str[10];
 		char request_uri[13];
-		parse(buffer, &request_method, request_uri, 13);
-		printf("%s %s\n", request_method == GET ? "GET" : (request_method == POST ? "POST" : "UNKN"), request_uri);
+		parse(buffer, &request_method, request_method_str, request_uri, 13);
+		printf("%s %s\n", request_method_str, request_uri);
 
 		switch(request_method){
 			case GET:
