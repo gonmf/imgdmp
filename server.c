@@ -232,12 +232,20 @@ static char * find_mem(char * hay, unsigned int h_len, char * needle, unsigned i
 
 static file_info * parse_data(char * buffer, unsigned int len, char * not_an_image, char * too_large, char * format_error, char * out_of_memory, char * format_error_or_too_large){
 	*not_an_image = 0;
-
 	/* discover encform boundary */
 	char * boundarystart = " boundary=";
-	boundarystart = strstr(buffer, boundarystart) + strlen(boundarystart);
+	boundarystart = strstr(buffer, boundarystart);
+	if(boundarystart == NULL){
+		*format_error = 1;
+		return NULL;
+	}
+	boundarystart += strlen(boundarystart);
 	char * boundaryend = "\r\n";
 	boundaryend = strstr(boundarystart, boundaryend);
+	if(boundaryend == NULL){
+		*format_error = 1;
+		return NULL;
+	}
 	char boundary[100];
 	if(boundaryend - boundarystart > 100){
 		*format_error = 1;
@@ -395,11 +403,14 @@ int main(int argc, char * argv[]){
 			}
 		}
 
-		char request_method;
+		char request_method = 0;
 		char request_method_str[10];
 		char request_uri[13];
 		parse(buffer, &request_method, request_method_str, request_uri, 13);
-		printf("%s %s\n", request_method_str, request_uri);
+		if(request_method == 0)
+			printf("UNKN %s\n", request_uri);
+		else
+			printf("%s %s\n", request_method_str, request_uri);
 
 		switch(request_method){
 			case GET:
