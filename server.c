@@ -230,69 +230,82 @@ static char * find_mem(char * hay, unsigned int h_len, char * needle, unsigned i
 	return NULL;
 }
 
-static file_info * parse_data(char * buffer, unsigned int len, char * not_an_image, char * too_large, char * format_error, char * out_of_memory, char * format_error_or_too_large){
-	*not_an_image = 0;
-	/* discover encform boundary */
-	char * boundarystart = " boundary=";
-	boundarystart = strstr(buffer, boundarystart);
-	if(boundarystart == NULL){
-		*format_error = 1;
+static char * find_in_between(char * s, unsigned int len, char * l, char * r, unsigned int * flen){
+	char * r1 = find_mem(s, len, l, strlen(l));
+	if(r1 == NULL)
 		return NULL;
-	}
-	boundarystart += strlen(boundarystart);
-	char * boundaryend = "\r\n";
-	boundaryend = strstr(boundarystart, boundaryend);
-	if(boundaryend == NULL){
-		*format_error = 1;
+	r1 += strlen(l);
+	char * r2 = find_mem(r1, len - (r1 - s), r, strlen(r));
+	if(r2 == NULL)
 		return NULL;
-	}
-	char boundary[100];
-	if(boundaryend - boundarystart > 100){
-		*format_error = 1;
-		return NULL;
-	}
-	memcpy(boundary, boundarystart, boundaryend - boundarystart);
-	boundary[boundaryend - boundarystart] = 0;
+	*flen = r2 - r1;
+	return r1;
+}
 
-	/* find context of type image */
-	char * s = strstr(boundaryend, boundary);
-	s = strstr(s, "\r\n\r\n");
-	if(s == NULL){
-		*format_error = 1;
-		return NULL;
-	}
-	s += 4; /* CRLFCRLF */
-	*(s - 1) = 0; /* to search less */
-	if(strstr(boundaryend, "Content-Type: image/") == NULL){
+static file_info * parse_data(char * buffer, unsigned int len, char * not_an_image, char * too_large, char * format_error, char * out_of_memory, char * format_error_or_too_large){
+
+	char * content_type_str = "Content-Type: image/";
+	if(find_mem(buffer, len > 1024 ? 1024 : len, content_type_str, strlen(content_type_str)) == NULL){
 		*not_an_image = 1;
 		return NULL;
 	}
-	char * se = find_mem(s, len - (s - buffer), boundary, strlen(boundary));
-	if(se == NULL){
-		*format_error_or_too_large = 1;
-		return NULL;
-	}
-	se -= 4; /* CRLF */
 
-	if(se - s > MAX_FILE_SIZ * 1024){
-		*too_large = 1;
+	/* find content marker */
+	unsigned int blen;
+	char * bstart = find_in_between(buffer, len > 1024 ? 1024 : len, " boundary=", "\r", &blen);
+	if(bstart == NULL || blen > 99){
+		*format_error = 1;
 		return NULL;
 	}
 
+	char boundary[100];
+	memcpy(boundary, bstart, blen);
+	boundary[blen] = 0;
+
+	/* find content */
+	bstart = find_mem(bstart, len - (bstart - buffer), "\r\n\r\n", 4);
+	if(bstart == NULL){
+		*format_error = 1;
+		return NULL;
+	}
+	bstart = find_mem(bstart, len - (bstart - buffer), boundary, strlen(boundary));
+	if(bstart == NULL){
+		*format_error = 1;
+		return NULL;
+	}
+	bstart = find_mem(bstart, len - (bstart - buffer), "\r\n\r\n", 4);
+	if(bstart == NULL){
+		*format_error = 1;
+		return NULL;
+	}
+
+	char * cstart = find_mem(bstart, len - (bstart - buffer), boundary, strlen(boundary));
+	if(bstart == NULL){
+		*format_error = 1;
+		return NULL;
+	}
+
+	/* padding fixes */
+	bstart += 4;
+	cstart -= 4;
+
+	unsigned int clen = cstart - bstart;
+
+	/* save data */
 	file_info * ret = (file_info *)malloc(sizeof(file_info));
 	if(ret == NULL){
 		*out_of_memory = 1;
 		return NULL;
 	}
 	ret->id = new_id();
-	ret->len = se - s;
+	ret->len = clen;
 	ret->data = malloc(ret->len);
 	if(ret->data == NULL){
 		*out_of_memory = 1;
 		free(ret);
 		return NULL;
 	}
-	memcpy(ret->data, s, ret->len);
+	memcpy(ret->data, bstart, clen);
 	return ret;
 }
 
