@@ -15,12 +15,16 @@
 
 #define DEBUG 1
 
-#define GET 1
-#define POST 2
-#define HEAD 3
-#define PUT 4
-#define DELETE 5
-#define BIG_BUF_SIZ (1024 + MAX_FILE_SIZ * 1024)
+#define METHOD_GET 1
+#define METHOD_POST 2
+
+#define ERR_FILE_NOT_IMAGE 1
+#define ERR_FILE_TOO_LARGE_OR_BAD 2
+#define ERR_BAD_REQUEST 3
+#define ERR_OUT_OF_MEMORY 4
+
+#define MAX_HEADER_SIZ 1024 /* in bytes */
+#define BIG_BUF_SIZ (MAX_HEADER_SIZ + MAX_FILE_SIZ * 1024)
 
 typedef struct __file_info_ {
 	unsigned int id;
@@ -28,11 +32,12 @@ typedef struct __file_info_ {
 	void * data;
 } file_info;
 
-file_info ring[MAX_FILES];
+static file_info ring[MAX_FILES];
 static unsigned int ring_pos = 0;
 static unsigned int ring_files = 0;
 static unsigned int current_bytes = 0;
 static unsigned int last_id;
+static unsigned int start_id;
 
 static void init_id(){
 	struct timeval tv;
@@ -40,6 +45,7 @@ static void init_id(){
 	last_id = (unsigned int)(tv.tv_usec);
 	if(last_id == 0)
 		last_id = 1;
+	start_id = last_id;
 }
 
 static unsigned int new_id(){
@@ -138,28 +144,17 @@ static unsigned int copy_while_numeric(char * src, char * dst, unsigned int dst_
 
 static void parse(char * buffer, char * request_method, char * request_method_str, char * request_uri, unsigned int uri_sz){
 	unsigned int i = 0;
-	while(i < 9 && buffer[i] != ' '){
+	while(i < uri_sz  + 1 && buffer[i] != ' '){
 		request_method_str[i] = buffer[i];
 		++i;
 	}
 	request_method_str[i] = 0;
 	
 	if(strcmp(request_method_str, "GET") == 0)
-		*request_method = GET;
+		*request_method = METHOD_GET;
 	else
-		if(strcmp(request_method_str, "HEAD") == 0)
-			*request_method = HEAD;
-		else
-			if(strcmp(request_method_str, "POST") == 0)
-				*request_method = POST;
-			else	
-				if(strcmp(request_method_str, "PUT") == 0)
-					*request_method = PUT;
-				else	
-					if(strcmp(request_method_str, "DELETE") == 0)
-						*request_method = DELETE;
-					else
-						*request_method = 0;	
+		if(strcmp(request_method_str, "POST") == 0)
+			*request_method = METHOD_POST;
 
 	buffer += i + 1;
 	copy_while_alphanumeric(buffer, request_uri, uri_sz);
@@ -181,36 +176,41 @@ static file_info * load_file(const char * filename){
 	return ret;
 }
 
-static void full_write(int socket, char * buffer, unsigned int size){
+static void full_write(int socket, const char * buffer, unsigned int size){
 	int w;
-	while((w = write(socket, buffer, size)) > 0){
+	while(size > 0 && (w = write(socket, buffer, size)) > 0){
 		buffer += w;
 		size -= w;
 	}
 }
 
-static void return_msg(int code, char * text, const char * msg, int socket){
-	char buffer[2048];
-	snprintf(buffer, 2048, "HTTP/1.0 %d %s\nContent-Length: %lu\nServer: myn3\r\n\r\n%s", code, text, strlen(msg), msg);
-	full_write(socket, buffer, strlen(buffer));
-	printf("%d %s %s\n", code, text, msg);
+static void answer(int code, const char * code_text, const void * data, unsigned int data_len, int socket){
+	char buffer[200];
+	int w = snprintf(buffer, 200, "HTTP/1.0 %d %s\nContent-Length: %u\nServer: myn3\r\n\r\n", code, code_text, data_len);
+	if(w < 0 || w >= 200){
+		printf("Warning: Request answer buffer too small. Socket write failed.\n");
+		return;
+	}
+	full_write(socket, buffer, w);
+	full_write(socket, data, data_len);
+	printf("%d %s\n", code, code_text);
 }
 
-static void return_file(int code, char * text, const file_info * fi, int socket){
-	char buffer[1024];
-	snprintf(buffer, 1024, "HTTP/1.0 %d %s\nContent-Length: %u\nServer: myn3\r\n\r\n", code, text, fi->len);
-	full_write(socket, buffer, strlen(buffer));
-	full_write(socket, fi->data, fi->len);
-	printf("%d %s\n", code, text);
+static void return_msg(int code, const char * text, const char * msg, int socket){
+	if(msg == NULL)
+		answer(code, text, text, strlen(text), socket);
+	else
+		answer(code, text, msg, strlen(msg), socket);
+}
+
+static void return_file(int code, const char * text, const file_info * fi, int socket){
+	answer(code, text, fi->data, fi->len, socket);
 }
 
 static void return_hyperlink_to_file(const file_info * fi, int socket){
-	char buffer[2048];
-	char text[1024];
-	snprintf(text, 1024, "<html><body>Your file is available <a href=\"%d\">here</a>.</body></html>", fi->id);
-	snprintf(buffer, 2048, "HTTP/1.0 200 OK\nContent-Length: %lu\nServer: myn3\r\n\r\n%s", strlen(text), text);
-	full_write(socket, buffer, strlen(buffer));
-	printf("200 OK\n");
+	char text[100];
+	snprintf(text, 100, "<html><body>Your file is available <a href=\"%d\">here</a>.</body></html>", fi->id);
+	answer(201, "Create", text, strlen(text), socket);
 }
 
 static char * find_mem(char * hay, unsigned int h_len, char * needle, unsigned int n_len){
@@ -242,19 +242,18 @@ static char * find_in_between(char * s, unsigned int len, char * l, char * r, un
 	return r1;
 }
 
-static file_info * parse_data(char * buffer, unsigned int len, char * not_an_image, char * too_large, char * format_error, char * out_of_memory, char * format_error_or_too_large){
-
+static file_info * parse_data(char * buffer, unsigned int len, char * errn){
 	char * content_type_str = "Content-Type: image/";
-	if(find_mem(buffer, len > 1024 ? 1024 : len, content_type_str, strlen(content_type_str)) == NULL){
-		*not_an_image = 1;
+	if(find_mem(buffer, len > MAX_HEADER_SIZ ? MAX_HEADER_SIZ : len, content_type_str, strlen(content_type_str)) == NULL){
+		*errn = ERR_FILE_NOT_IMAGE;
 		return NULL;
 	}
 
 	/* find content marker */
 	unsigned int blen;
-	char * bstart = find_in_between(buffer, len > 1024 ? 1024 : len, " boundary=", "\r", &blen);
+	char * bstart = find_in_between(buffer, len > MAX_HEADER_SIZ ? MAX_HEADER_SIZ : len, " boundary=", "\r", &blen);
 	if(bstart == NULL || blen > 99){
-		*format_error = 1;
+		*errn = ERR_BAD_REQUEST;
 		return NULL;
 	}
 
@@ -265,23 +264,23 @@ static file_info * parse_data(char * buffer, unsigned int len, char * not_an_ima
 	/* find content */
 	bstart = find_mem(bstart, len - (bstart - buffer), "\r\n\r\n", 4);
 	if(bstart == NULL){
-		*format_error = 1;
+		*errn = ERR_BAD_REQUEST;
 		return NULL;
 	}
 	bstart = find_mem(bstart, len - (bstart - buffer), boundary, strlen(boundary));
 	if(bstart == NULL){
-		*format_error = 1;
+		*errn = ERR_BAD_REQUEST;
 		return NULL;
 	}
 	bstart = find_mem(bstart, len - (bstart - buffer), "\r\n\r\n", 4);
 	if(bstart == NULL){
-		*format_error = 1;
+		*errn = ERR_BAD_REQUEST;
 		return NULL;
 	}
 
 	char * cstart = find_mem(bstart, len - (bstart - buffer), boundary, strlen(boundary));
 	if(bstart == NULL){
-		*format_error = 1;
+		*errn = ERR_FILE_TOO_LARGE_OR_BAD;
 		return NULL;
 	}
 
@@ -294,14 +293,14 @@ static file_info * parse_data(char * buffer, unsigned int len, char * not_an_ima
 	/* save data */
 	file_info * ret = (file_info *)malloc(sizeof(file_info));
 	if(ret == NULL){
-		*out_of_memory = 1;
+		*errn = ERR_OUT_OF_MEMORY;
 		return NULL;
 	}
 	ret->id = new_id();
 	ret->len = clen;
 	ret->data = malloc(ret->len);
 	if(ret->data == NULL){
-		*out_of_memory = 1;
+		*errn = ERR_OUT_OF_MEMORY;
 		free(ret);
 		return NULL;
 	}
@@ -390,43 +389,33 @@ int main(int argc, char * argv[]){
 		++connection_nr;
 		printf("Connection #%u established\n", connection_nr);
 
+		char found_end_of_request = 0;
 		unsigned int request_size = 0;
 		int r;
-		unsigned int total_size = 0;
-		while(request_size < 1024 && (r = read(client_fd, buffer + request_size, BIG_BUF_SIZ - request_size)) > 0){
+		while(request_size < MAX_HEADER_SIZ && (r = read(client_fd, buffer + request_size, BIG_BUF_SIZ - request_size)) > 0){
 			request_size += r;
 			buffer[request_size] = 0;
 			if(strstr(buffer, "\r\n\r\n") != NULL){
-				total_size = parse_content_length(buffer, request_size); /* 0 if unavailable */
+				found_end_of_request = 1;
 				break;
 			}
 		}
-
-		if(total_size >= BIG_BUF_SIZ){
-			return_msg(400, "Bad Request", "Request too large.", client_fd);
+		if(found_end_of_request == 0){
+			return_msg(413, "Request Entity Too Large", NULL, client_fd);
 			close_socket(client_fd);
 			continue;
-		}
-
-		if(total_size != 0){
-			total_size -= request_size;
-			while(total_size > 0 && (r = read(client_fd, buffer + request_size, total_size)) > 0){
-				request_size += r;
-				total_size -= r;
-			}
 		}
 
 		char request_method = 0;
 		char request_method_str[10];
 		char request_uri[13];
 		parse(buffer, &request_method, request_method_str, request_uri, 13);
-		if(request_method == 0)
-			printf("UNKN %s\n", request_uri);
-		else
-			printf("%s %s\n", request_method_str, request_uri);
 
+		printf("%s %s\n", request_method_str, request_uri);
+
+		unsigned int total_size;
 		switch(request_method){
-			case GET:
+			case METHOD_GET:
 				if(request_uri[0] == '/'){
 					if(request_uri[1] == 0)
 						return_file(200, "OK", index_get_file, client_fd);
@@ -435,53 +424,68 @@ int main(int argc, char * argv[]){
 						copy_while_numeric(request_uri + 1, id_buf, 20);
 						int id = atoi(id_buf);
 						if(id < 1)
-							return_msg(400, "Bad Request", "Access denied.", client_fd);
+							return_msg(204, "No Content", NULL, client_fd);
 						else{
 							const file_info * fi = get_file(id);
-							if(fi == NULL)
-								return_msg(404, "Not Found", "File not found.", client_fd);
-							else
+							if(fi == NULL){
+								if(id >= start_id && id < last_id)
+									return_msg(410, "Gone", NULL, client_fd);
+								else
+									return_msg(404, "Not Found", NULL, client_fd);
+							}else
 								return_file(200, "OK", fi, client_fd);
 						}
 					}
 				}else
-					return_msg(400, "Bad Request", "Access denied.", client_fd);
+					return_msg(204, "Not Content", NULL, client_fd);
 				break;
-			case POST:
+			case METHOD_POST:
+				/* read rest of request */
+				total_size = parse_content_length(buffer, request_size); /* 0 if unavailable */
+				if(total_size >= BIG_BUF_SIZ){
+					return_msg(413, "Request Entity Too Large", NULL, client_fd);
+					break;
+				}
+				if(total_size == 0){
+					return_msg(411, "Length Required", NULL, client_fd);
+					break;
+				}
+				total_size -= request_size;
+				while(total_size > 0 && (r = read(client_fd, buffer + request_size, total_size)) > 0){
+					request_size += r;
+					total_size -= r;
+				}
+
 				if(strcmp(request_uri, "/") == 0){
-					char not_an_image = 0;
-					char too_large = 0;
-					char format_error = 0;
-					char out_of_memory = 0;
-					char format_error_or_too_large = 0;
-					file_info * data = parse_data(buffer, request_size, &not_an_image, &too_large, &format_error, &out_of_memory, &format_error_or_too_large);
-					if(not_an_image)
-						return_msg(400, "Bad Request", "File is not an image.", client_fd);
-					else
-						if(too_large)
-							return_msg(400, "Bad Request", "File is too large.", client_fd);
-						else
-							if(format_error)
-								return_msg(400, "Bad Request", "Malformed request.", client_fd);
-							else
-								if(out_of_memory)
-									return_msg(400, "Bad Request", "System out of memory", client_fd);
-								else
-									if(format_error_or_too_large)
-										return_msg(400, "Bad Request", "File is too large or the request was malformed.", client_fd);
-									else
-										if(data == NULL){
-											return_msg(400, "Bad Request", "Unspecified error parsing request.", client_fd);
-										}else{
-											save_file(data);
-											return_hyperlink_to_file(data, client_fd);
-											free(data);
-										}
+					char errn = 0;
+					file_info * data = parse_data(buffer, request_size, &errn);
+					switch(errn){
+						case ERR_FILE_NOT_IMAGE:
+							return_msg(415, "Unsupported Media Type", "File is not an image.", client_fd);
+							break;
+						case ERR_FILE_TOO_LARGE_OR_BAD:
+							return_msg(400, "Bad Request", "File is too large or the request was malformed.", client_fd);
+							break;
+						case ERR_BAD_REQUEST:
+							return_msg(400, "Bad Request", "Malformed request.", client_fd);
+							break;
+						case ERR_OUT_OF_MEMORY:
+							return_msg(400, "Bad Request", "System out of memory.", client_fd);
+							break;
+						default:
+							if(data == NULL){
+								return_msg(400, "Bad Request", "Unspecified error parsing request.", client_fd);
+							}else{
+								save_file(data);
+								return_hyperlink_to_file(data, client_fd);
+								free(data);
+							}
+					}
 				}else
-					return_msg(400, "Bad Request", "Access denied.", client_fd);
+					return_msg(204, "Not Content", NULL, client_fd);
 				break;
 			default:
-				return_msg(400, "Bad Request", "Access denied.", client_fd);
+				return_msg(204, "Not Content", NULL, client_fd);
 		}
 		close_socket(client_fd);
 	}
