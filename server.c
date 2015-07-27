@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <signal.h>
 
+#include "zlib.h"
+
 #define MAX_FILE_SIZ 512 /* in KiB */
 #define MAX_FILES 1000
 #define PORT 81
@@ -30,6 +32,7 @@ typedef struct __file_info_ {
 	unsigned int id;
 	unsigned int len;
 	void * data;
+	char compressed;	
 } file_info;
 
 static file_info ring[MAX_FILES];
@@ -60,6 +63,7 @@ static void save_file(const file_info * fi){
 		ring[ring_pos].id = fi->id;
 		ring[ring_pos].len = fi->len;
 		ring[ring_pos].data = fi->data;
+		ring[ring_pos].compressed = fi->compressed;
 		current_bytes += fi->len;
 		++ring_files;
 	}else{
@@ -68,6 +72,7 @@ static void save_file(const file_info * fi){
 		ring[ring_pos].id = fi->id;
 		ring[ring_pos].len = fi->len;
 		ring[ring_pos].data = fi->data;
+		ring[ring_pos].compressed = fi->compressed;
 		current_bytes += fi->len;
 	}
 	ring_pos++;
@@ -142,7 +147,7 @@ static unsigned int copy_while_numeric(char * src, char * dst, unsigned int dst_
 	return ret;
 }
 
-static void parse(char * buffer, char * request_method, char * request_method_str, char * request_uri, unsigned int uri_sz){
+static void parse(char * buffer, char * request_method, char * request_method_str, char * request_uri, unsigned int uri_sz, char * accept_deflate){
 	unsigned int i = 0;
 	while(i < uri_sz  + 1 && buffer[i] != ' '){
 		request_method_str[i] = buffer[i];
@@ -158,6 +163,9 @@ static void parse(char * buffer, char * request_method, char * request_method_st
 
 	buffer += i + 1;
 	copy_while_alphanumeric(buffer, request_uri, uri_sz);
+
+	if((buffer = strstr(buffer, "Accept-Encoding: ")) != NULL)
+		*accept_deflate = strstr(buffer, " deflate") != NULL;
 }
 
 static file_info * load_file(const char * filename){
@@ -173,6 +181,7 @@ static file_info * load_file(const char * filename){
 	ret->len = size;
 	ret->data = malloc(ret->len);
 	memcpy(ret->data, buffer, ret->len);
+	ret->compressed = 0;
 	return ret;
 }
 
@@ -184,9 +193,14 @@ static void full_write(int socket, const char * buffer, unsigned int size){
 	}
 }
 
-static void answer(int code, const char * code_text, const void * data, unsigned int data_len, int socket){
+static void answer(int code, const char * code_text, const void * data, unsigned int data_len, char compressed, int socket){
 	char buffer[200];
-	int w = snprintf(buffer, 200, "HTTP/1.0 %d %s\nContent-Length: %u\nServer: myn3\r\n\r\n", code, code_text, data_len);
+	int w;
+	if(compressed)
+		w = snprintf(buffer, 200, "HTTP/1.0 %d %s\nContent-Length: %u\nServer: myn3\nContent-Encoding: deflate\r\n\r\n", code, code_text, data_len);
+	else
+		w = snprintf(buffer, 200, "HTTP/1.0 %d %s\nContent-Length: %u\nServer: myn3\r\n\r\n", code, code_text, data_len);
+	
 	if(w < 0 || w >= 200){
 		printf("Warning: Request answer buffer too small. Socket write failed.\n");
 		return;
@@ -198,19 +212,19 @@ static void answer(int code, const char * code_text, const void * data, unsigned
 
 static void return_msg(int code, const char * text, const char * msg, int socket){
 	if(msg == NULL)
-		answer(code, text, text, strlen(text), socket);
+		answer(code, text, text, strlen(text), 0, socket);
 	else
-		answer(code, text, msg, strlen(msg), socket);
+		answer(code, text, msg, strlen(msg), 0, socket);
 }
 
 static void return_file(int code, const char * text, const file_info * fi, int socket){
-	answer(code, text, fi->data, fi->len, socket);
+	answer(code, text, fi->data, fi->len, fi->compressed, socket);
 }
 
 static void return_hyperlink_to_file(const file_info * fi, int socket){
 	char text[100];
 	snprintf(text, 100, "<html><body>Your file is available <a href=\"%d\">here</a>.</body></html>", fi->id);
-	answer(201, "Create", text, strlen(text), socket);
+	answer(201, "Create", text, strlen(text), 0, socket);
 }
 
 static char * find_mem(char * hay, unsigned int h_len, char * needle, unsigned int n_len){
@@ -304,7 +318,26 @@ static file_info * parse_data(char * buffer, unsigned int len, char * errn){
 		free(ret);
 		return NULL;
 	}
+	unsigned char * tmp = malloc(ret->len + 64 * 1024);
+	if(ret->data == NULL){
+		*errn = ERR_OUT_OF_MEMORY;
+		free(ret->data);
+		free(ret);
+		return NULL;
+	}
 	memcpy(ret->data, bstart, clen);
+	ret->compressed = 0;
+
+	unsigned long int dst_len = ret->len + 64 * 1024;
+ 	int c = compress(tmp, &dst_len, ret->data, ret->len);
+ 	if(c == Z_OK && dst_len < ret->len){ /* worth the compression */
+ 		memcpy(ret->data, tmp, dst_len);
+ 		ret->len = dst_len;
+		ret->compressed = 1;
+		printf("File compressed with deflate zlib\n");
+ 	}
+ 	free(tmp);
+
 	return ret;
 }
 
@@ -409,7 +442,8 @@ int main(int argc, char * argv[]){
 		char request_method = 0;
 		char request_method_str[10];
 		char request_uri[13];
-		parse(buffer, &request_method, request_method_str, request_uri, 13);
+		char accept_deflate = 0;
+		parse(buffer, &request_method, request_method_str, request_uri, 13, &accept_deflate);
 
 		printf("%s %s\n", request_method_str, request_uri);
 
@@ -432,8 +466,12 @@ int main(int argc, char * argv[]){
 									return_msg(410, "Gone", NULL, client_fd);
 								else
 									return_msg(404, "Not Found", NULL, client_fd);
-							}else
-								return_file(200, "OK", fi, client_fd);
+							}else{
+								if(accept_deflate == 0 && fi->compressed == 1)
+									return_msg(412, "Precondition Failed", NULL, client_fd);
+								else /* regardless of request, client must always support uncompressed */
+									return_file(200, "OK", fi, client_fd);
+							}
 						}
 					}
 				}else
